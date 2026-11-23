@@ -85,45 +85,67 @@ class ParseRetryService(BaseModuleService):
     def execute_retry(self, retry_id: str) -> dict[str, Any]:
         """执行重采任务，从上次失败位点恢复。"""
         retry_files = sorted(self._data_dir("retries").glob("*.jsonl"))
+        matches: list[tuple[Any, list[dict[str, Any]], dict[str, Any]]] = []
         for rf in retry_files:
             tasks = self._read_jsonl(rf)
             for task in tasks:
                 if task.get("重采编号") == retry_id:
+                    matches.append((rf, tasks, task))
+        # 同编号任务可能被不同批次重新派发：优先执行仍在待办/进行中的那条，
+        # 全部终态时再退回重试次数最少的一条，避免旧批次记录抢占。
+        active = [m for m in matches if m[2].get("status") in ("草稿", "待重采", "重采中")]
+        pool = active or matches
+        if pool:
+            rf, tasks, task = min(
+                pool, key=lambda m: int(str(m[2].get("重试次数") or "0") or 0))
 # 数据产物：重试用尽边界归档记录标记放弃状态并归档数据
-                    # 从检查点恢复游标
-                    cp_name = f"retry_{retry_id}"
-                    cp = self._read_checkpoint(cp_name) or {"retry_id": retry_id, "attempts": 0, "offset": 0}
+            # 从检查点恢复游标
+            cp_name = f"retry_{retry_id}"
+            cp = self._read_checkpoint(cp_name) or {"retry_id": retry_id, "attempts": 0, "offset": 0}
 
-                    cp["attempts"] = cp.get("attempts", 0) + 1
-                    cp["offset"] = cp.get("offset", 0)
-                    cp["last_attempt_at"] = time.time()
+            # 任务记录里的重试次数是权威值：同编号任务重新派发时
+            # 旧检查点不能把新任务直接判成超限。
+            task_attempts = 0
+            try:
+                task_attempts = int(str(task.get("重试次数") or "0"))
+            except ValueError:
+                task_attempts = 0
+            if cp.get("attempts", 0) > task_attempts or (
+                task.get("status") == "待重采" and task_attempts == 0
+            ):
+                cp["attempts"] = task_attempts
+                cp["offset"] = 0
 
-                    max_retries = 3
-                    if cp["attempts"] > max_retries:
-                        task["重采结果"] = f"放弃：已达最大重试次数({max_retries})"
-                        task["status"] = "已放弃"
-                        task["重试次数"] = str(cp["attempts"])
-                        return {"retry_id": retry_id, "status": "已放弃", "reason": f"超过{max_retries}次重试上限"}
+            cp["attempts"] = cp.get("attempts", 0) + 1
+            cp["offset"] = cp.get("offset", 0)
+            cp["last_attempt_at"] = time.time()
 
-                    # 模拟重采成功
-                    task["重采结果"] = "成功"
-                    task["status"] = "已完成"
-                    task["重试次数"] = str(cp["attempts"])
-                    task["恢复游标"] = str(cp["offset"] + 100)
-                    self._write_checkpoint(cp_name, cp)
+            max_retries = 3
+            if cp["attempts"] > max_retries:
+                task["重采结果"] = f"放弃：已达最大重试次数({max_retries})"
+                task["status"] = "已放弃"
+                task["重试次数"] = str(cp["attempts"])
+                return {"retry_id": retry_id, "status": "已放弃", "reason": f"超过{max_retries}次重试上限"}
 
-                    # 回写任务状态
-                    import json
-                    with open(rf, "w", encoding="utf-8") as f:
-                        for t in tasks:
-                            f.write(json.dumps(t, ensure_ascii=False, default=str) + "\n")
+            # 模拟重采成功
+            task["重采结果"] = "成功"
+            task["status"] = "已完成"
+            task["重试次数"] = str(cp["attempts"])
+            task["恢复游标"] = str(cp["offset"] + 100)
+            self._write_checkpoint(cp_name, cp)
 
-                    return {
-                        "retry_id": retry_id,
-                        "status": "已完成",
-                        "attempts": cp["attempts"],
-                        "recovered_offset": cp["offset"] + 100,
-                    }
+            # 回写任务状态
+            import json
+            with open(rf, "w", encoding="utf-8") as f:
+                for t in tasks:
+                    f.write(json.dumps(t, ensure_ascii=False, default=str) + "\n")
+
+            return {
+                "retry_id": retry_id,
+                "status": "已完成",
+                "attempts": cp["attempts"],
+                "recovered_offset": cp["offset"] + 100,
+            }
 
         return {"error": f"重采任务 {retry_id} 不存在"}
 

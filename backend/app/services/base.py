@@ -9,19 +9,57 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import threading
 import time
 import importlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from app.store import store
 
 DATA_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "data"
 
+# 同一数据产物可能被多个并发识别请求同时读改写（例如单区识别与整页识别
+# 同时命中同一个图片区域）。按文件路径持有一把可重入锁，配合临时文件
+# + os.replace 的原子替换，保证刷新时永远读到完整版本。
+_FILE_LOCKS: dict[str, threading.RLock] = {}
+_FILE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.RLock:
+    """取得某个产物文件对应的进程内可重入锁。"""
+    key = str(path.resolve())
+    with _FILE_LOCKS_GUARD:
+        lock = _FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _FILE_LOCKS[key] = lock
+        return lock
+
 
 def _ensure_dir(path: Path) -> None:
     """创建目录（含所有父目录），已有则跳过，确保数据产物写入路径存在。"""
     path.mkdir(parents=True, exist_ok=True)
+
+
+def bbox_position(bbox: str) -> tuple[float, float]:
+    """从 ``(x1, y1, x2, y2)`` 形式的bbox解析上沿与左沿，用于页内阅读顺序。
+
+    解析失败的区域排到页尾，保证同一批数据每次排序结果一致。
+    """
+    numbers: list[float] = []
+    buff = ""
+    for char in bbox:
+        if char.isdigit() or char in ".-":
+            buff += char
+        elif buff:
+            numbers.append(float(buff))
+            buff = ""
+    if buff:
+        numbers.append(float(buff))
+    if len(numbers) >= 2:
+        return numbers[1], numbers[0]
+    return float("inf"), float("inf")
 
 
 class BaseModuleService:
@@ -140,6 +178,75 @@ class BaseModuleService:
                     except json.JSONDecodeError:
                         continue
         return records
+
+    def _atomic_write_jsonl(self, filepath: Path, records: Iterable[dict[str, Any]]) -> int:
+        """整文件原子替换写入：先写同目录临时文件再os.replace，读者不会看到半行。"""
+        _ensure_dir(filepath.parent)
+        with _file_lock(filepath):
+            tmp_path = filepath.with_name(
+                f".{filepath.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            written = 0
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    for rec in records:
+                        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+                        written += 1
+                os.replace(tmp_path, filepath)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink(missing_ok=True)
+            return written
+
+    def _upsert_jsonl(
+        self,
+        filepath: Path,
+        records: list[dict[str, Any]],
+        key_fields: tuple[str, ...],
+        *,
+        prefer_existing: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """按业务键合并写入JSONL产物，重复键只保留一条并保持原有先后顺序。
+
+        单区识别与整页识别可能并发产出同一图片区域的结果，这里是唯一的
+        落盘入口：读旧记录、按键覆盖、原子替换，整个过程持有文件锁。
+        ``prefer_existing=True`` 时保留先到的那条（用于“先确认先定稿”）。
+        """
+        _ensure_dir(filepath.parent)
+        with _file_lock(filepath):
+            existing = self._read_jsonl(filepath)
+            merged: list[dict[str, Any]] = []
+            positions: dict[tuple[str, ...], int] = {}
+            for rec in existing:
+                key = tuple(str(rec.get(field, "")) for field in key_fields)
+                positions[key] = len(merged)
+                merged.append(rec)
+            for rec in records:
+                key = tuple(str(rec.get(field, "")) for field in key_fields)
+                if key in positions:
+                    if not prefer_existing:
+                        merged[positions[key]] = rec
+                    continue
+                positions[key] = len(merged)
+                merged.append(rec)
+            written = self._atomic_write_jsonl(filepath, merged)
+        return merged, written
+
+    def _update_jsonl(
+        self,
+        filepath: Path,
+        key_fields: tuple[str, ...],
+        key_values: tuple[str, ...],
+        updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """按业务键原地更新一条记录并原子回写，返回更新后的记录（不存在返回None）。"""
+        with _file_lock(filepath):
+            records = self._read_jsonl(filepath)
+            for rec in records:
+                if tuple(str(rec.get(field, "")) for field in key_fields) == key_values:
+                    rec.update(updates)
+                    self._atomic_write_jsonl(filepath, records)
+                    return rec
+        return None
 
     def _write_checkpoint(self, name: str, state: dict[str, Any]) -> Path:
         """写入检查点文件，用于中断恢复与游标推进。检查点记录当前处理偏移和状态。"""
@@ -264,6 +371,14 @@ class BaseModuleService:
             return cls().recognize_from_area(image_area_id)
         except Exception as e:
             return {"auto_trigger": "ocr_engine", "image_area_id": image_area_id, "error": str(e)}
+
+    def _trigger_ocr_page(self, doc_id: str) -> dict[str, Any]:
+        """版式还原后整页识别，与单区识别共用同一套区域凭据去重。"""
+        try:
+            cls = self._safe_import("app.services.ocr_engine", "OcrEngineService")
+            return cls().batch_recognize_all_images(doc_id)
+        except Exception as e:
+            return {"auto_trigger": "ocr_engine", "doc_id": doc_id, "error": str(e)}
 
     def _trigger_vector_embed(self, chunk_id: str) -> dict[str, Any]:
         """分块完成后自动触发向量嵌入，将文本分块转换为向量索引。"""

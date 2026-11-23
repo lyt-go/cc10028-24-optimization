@@ -143,6 +143,10 @@ class FormatParseService(BaseModuleService):
             triggers["chunk_split"] = trig_chunk
             trig_layout = self._trigger_layout_restore(doc_id)
             triggers["layout_restore"] = trig_layout
+            # 版式还原产出图片区域后执行整页识别；单区识别另行触发，
+            # 两者写入同一份区域凭据，重复区域只保留一段文本。
+            trig_ocr = self._trigger_ocr_page(doc_id)
+            triggers["ocr_engine"] = trig_ocr
             trig_quality = self._trigger_quality_check(doc_id)
             triggers["extract_quality"] = trig_quality
 
